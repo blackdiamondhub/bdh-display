@@ -10,6 +10,7 @@ import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
@@ -43,16 +44,24 @@ import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -91,6 +100,23 @@ public class MainActivity extends Activity {
     private volatile String currentUrl = "";
     private DebugServer debugServer;
 
+    // ---- Crash/OOM diagnostics ----
+    private static final long SAMPLE_MS = 30_000;
+    private static final int SAMPLE_RING = 20;
+    private static final long MEM_DUMP_THROTTLE_MS = 2 * 60_000;
+    private static final String[] COUNTERS = {"starts", "renderer_crashes", "renderer_oom", "hangs",
+            "process_deaths", "reboots", "upgrades", "bg_kills", "low_memory"};
+    private final ArrayDeque<String> memRing = new ArrayDeque<>();
+    private final long startedWallMs = System.currentTimeMillis();
+    private HandlerThread diagThread;
+    private Handler diag;
+    private RunMarker marker;
+    private String bootId = "";
+    private volatile String pageStats = "";
+    private volatile int lastTrimLevel = -1;
+    private volatile boolean stopped, destroyed;
+    private long lastMemDump;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -103,6 +129,12 @@ public class MainActivity extends Activity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         WebView.setWebContentsDebuggingEnabled(true);
         prefs = getSharedPreferences("bdh", MODE_PRIVATE);
+        diagThread = new HandlerThread("diag");
+        diagThread.start();
+        diag = new Handler(diagThread.getLooper());
+        marker = new RunMarker(new File(getFilesDir(), "run.marker"));
+        checkPreviousRun();
+        bump("starts");
 
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
@@ -119,6 +151,7 @@ public class MainActivity extends Activity {
         debugServer = new DebugServer(this::route);
         debugServer.start();
         h.postDelayed(heartbeat, HEARTBEAT_MS);
+        h.post(sampler);
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
         }
@@ -232,6 +265,9 @@ public class MainActivity extends Activity {
             crashTimes.addLast(now);
             while (!crashTimes.isEmpty() && now - crashTimes.peekFirst() > 10 * 60_000) crashTimes.removeFirst();
             boolean loop = crashTimes.size() >= 5;
+            // didCrash=false: the system killed the renderer to reclaim memory.
+            bump(d.didCrash() ? "renderer_crashes" : "renderer_oom");
+            dumpMemHistory("renderer gone");
             showOverlay(loop ? "Display recovering (repeated crashes)…" : "Reloading…");
             recreate("renderer gone (crashed=" + d.didCrash() + ", priority=" + d.rendererPriorityAtExit()
                             + ", url=" + currentUrl + ", total " + crashes + ")",
@@ -327,6 +363,8 @@ public class MainActivity extends Activity {
             h.postDelayed(() -> {
                 if (web != null && pingSeq == seq && pongSeq < seq) {
                     hangs++;
+                    bump("hangs");
+                    dumpMemHistory("renderer hang");
                     showOverlay("Reloading…");
                     recreate("renderer unresponsive (total " + hangs + ")", 1_000);
                 }
@@ -623,7 +661,7 @@ public class MainActivity extends Activity {
             h.postDelayed(this, HEARTBEAT_MS);
             try {
                 JSONObject m = memory();
-                log("heartbeat url=" + currentUrl + " mem=" + m);
+                log("heartbeat url=" + currentUrl + " page=" + pageStats + " mem=" + m);
             } catch (Exception e) {
                 log("heartbeat failed: " + e);
             }
@@ -657,7 +695,181 @@ public class MainActivity extends Activity {
                 .put("mic_permission", checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
                 .put("log_seq", DebugLog.lastSeq())
                 .put("memory", memory())
+                .put("page", pageStats)
+                .put("last_trim_level", lastTrimLevel)
+                .put("mem_history", memHistory())
+                .put("lifetime", lifetimeCounters())
+                .put("last_unclean_exit", jsonOrNull(prefs.getString("last_unclean_exit", null)))
                 .put("token_configured", !BuildInfo.DEBUG_TOKEN_SHA256.isEmpty());
+    }
+
+    private static Object jsonOrNull(String s) {
+        try {
+            return s == null ? JSONObject.NULL : new JSONObject(s);
+        } catch (Exception e) {
+            return s;
+        }
+    }
+
+    // ---- Crash/OOM diagnostics -----------------------------------------------
+
+    private synchronized void bump(String counter) {
+        prefs.edit().putLong("n_" + counter, prefs.getLong("n_" + counter, 0) + 1).apply();
+    }
+
+    private JSONObject lifetimeCounters() throws Exception {
+        JSONObject j = new JSONObject();
+        for (String c : COUNTERS) j.put(c, prefs.getLong("n_" + c, 0));
+        return j;
+    }
+
+    private JSONArray memHistory() {
+        synchronized (memRing) {
+            return new JSONArray(memRing);
+        }
+    }
+
+    /** Classifies how the previous process ended; for unexplained deaths, recovers its logcat. */
+    private void checkPreviousRun() {
+        bootId = readBootId();
+        Properties prev = marker.readPrevious();
+        if (prev == null) return;
+        long pkgUpdated = 0;
+        String version = "?";
+        try {
+            PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            pkgUpdated = pi.lastUpdateTime;
+            version = String.valueOf(pi.versionCode);
+        } catch (Exception ignored) {
+        }
+        String reason = RunMarker.classify(prev, bootId, SystemClock.elapsedRealtime(), version, pkgUpdated);
+        switch (reason) {
+            case RunMarker.EXIT_REBOOT: bump("reboots"); break;
+            case RunMarker.EXIT_UPGRADE: bump("upgrades"); break;
+            case RunMarker.EXIT_BACKGROUND: bump("bg_kills"); break;
+            default: bump("process_deaths");
+        }
+        try {
+            JSONObject j = new JSONObject().put("reason", reason)
+                    .put("detected_at", new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(new Date()));
+            for (String k : prev.stringPropertyNames()) j.put(k, prev.getProperty(k));
+            prefs.edit().putString("last_unclean_exit", j.toString()).apply();
+        } catch (Exception ignored) {
+        }
+        DebugLog.w("previous run ended uncleanly: " + reason + " " + prev);
+        if (RunMarker.EXIT_DIED.equals(reason)) {
+            final String pid = prev.getProperty("pid", "");
+            diag.post(() -> {
+                // Same uid survives a restart, so the dead pid's lines (and its tombstone) are still readable.
+                List<String> lines = RunMarker.filterLogcat(
+                        logcatLines("-d", "-v", "threadtime", "-b", "main,system,crash", "-t", "5000"), pid, 200);
+                DebugLog.w("prev-logcat pid " + pid + " (" + lines.size() + " lines):\n" + String.join("\n", lines));
+            });
+        }
+    }
+
+    private static String readBootId() {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                new FileInputStream("/proc/sys/kernel/random/boot_id"), StandardCharsets.UTF_8))) {
+            String s = br.readLine();
+            return s == null ? "" : s.trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static final String PAGE_STATS_JS = "(function(){var v=0,p=0,f=0;"
+            + "function s(d){try{var vs=d.querySelectorAll('video');v+=vs.length;"
+            + "for(var i=0;i<vs.length;i++)if(!vs[i].paused&&!vs[i].ended&&vs[i].readyState>2)p++;"
+            + "var fr=d.querySelectorAll('iframe');f+=fr.length;"
+            + "for(var j=0;j<fr.length;j++){try{s(fr[j].contentDocument)}catch(e){}}}catch(e){}}"
+            + "s(document);var m=performance.memory;"
+            + "return 'videos='+v+' playing='+p+' iframes='+f"
+            + "+(m?' heap='+Math.round(m.usedJSHeapSize/1048576)+'MB':'')+' path='+location.pathname})()";
+
+    /** Every SAMPLE_MS: page stats (UI thread), then memory sample + marker write (diag thread). */
+    private final Runnable sampler = new Runnable() {
+        @Override
+        public void run() {
+            h.postDelayed(this, SAMPLE_MS);
+            if (web != null && !mainFrameError) {
+                web.evaluateJavascript(PAGE_STATS_JS, v -> {
+                    try {
+                        pageStats = new JSONArray("[" + v + "]").optString(0, "");
+                    } catch (Exception e) {
+                        pageStats = String.valueOf(v);
+                    }
+                });
+            }
+            diag.post(MainActivity.this::sampleAndMark);
+        }
+    };
+
+    /** Diag thread only. */
+    private void sampleAndMark() {
+        String mem;
+        try {
+            JSONObject m = memory();
+            mem = "pss=" + m.optLong("app_pss_mb") + " native=" + m.optLong("native_heap_mb")
+                    + " java=" + m.optLong("java_used_mb") + " sys_avail=" + m.optLong("sys_avail_mb")
+                    + (m.optBoolean("sys_low") ? " SYS_LOW" : "");
+        } catch (Exception e) {
+            mem = "mem? " + e;
+        }
+        String entry = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + " " + mem
+                + (lastTrimLevel >= 0 ? " trim=" + lastTrimLevel : "") + " " + pageStats;
+        synchronized (memRing) {
+            memRing.addLast(entry);
+            while (memRing.size() > SAMPLE_RING) memRing.removeFirst();
+        }
+        writeMarker(mem);
+    }
+
+    /** Diag thread only. */
+    private void writeMarker(String mem) {
+        boolean talking;
+        synchronized (talkLock) { talking = talk != null; }
+        Map<String, String> s = new HashMap<>();
+        s.put("pid", String.valueOf(android.os.Process.myPid()));
+        try {
+            s.put("version", String.valueOf(getPackageManager().getPackageInfo(getPackageName(), 0).versionCode));
+        } catch (Exception ignored) {
+        }
+        s.put("boot_id", bootId);
+        s.put("started_wall_ms", String.valueOf(startedWallMs));
+        s.put("updated_wall_ms", String.valueOf(System.currentTimeMillis()));
+        s.put("elapsed_ms", String.valueOf(SystemClock.elapsedRealtime()));
+        s.put("uptime_s", String.valueOf((SystemClock.elapsedRealtime() - startedAt) / 1000));
+        s.put("url", currentUrl);
+        s.put("mem", mem);
+        s.put("page", pageStats);
+        s.put("trim", String.valueOf(lastTrimLevel));
+        s.put("talk", talking ? "1" : "0");
+        s.put("crashes", String.valueOf(crashes));
+        s.put("hangs", String.valueOf(hangs));
+        s.put("stopped", stopped ? "1" : "0");
+        try {
+            synchronized (marker) {
+                if (!destroyed) marker.write(s);
+            }
+        } catch (Exception e) {
+            DebugLog.w("marker write failed: " + e);
+        }
+    }
+
+    /** Logs the recent memory samples (plus a fresh one), at most once per MEM_DUMP_THROTTLE_MS. */
+    private void dumpMemHistory(String why) {
+        long now = SystemClock.elapsedRealtime();
+        synchronized (memRing) {
+            if (lastMemDump != 0 && now - lastMemDump < MEM_DUMP_THROTTLE_MS) return;
+            lastMemDump = now;
+        }
+        diag.post(() -> {
+            sampleAndMark();
+            List<String> copy;
+            synchronized (memRing) { copy = new ArrayList<>(memRing); }
+            DebugLog.w("mem history (" + why + "):\n" + String.join("\n", copy));
+        });
     }
 
     private DebugServer.Response route(DebugServer.Request r) throws Exception {
@@ -772,36 +984,61 @@ public class MainActivity extends Activity {
     }
 
     private static String logcat(int n) {
+        List<String> lines = logcatLines("-d", "-v", "time", "-t", String.valueOf(Math.max(1, n)));
+        StringBuilder sb = new StringBuilder();
+        for (String l : lines) sb.append(l).append('\n');
+        return sb.toString();
+    }
+
+    private static List<String> logcatLines(String... args) {
+        List<String> out = new ArrayList<>();
         try {
-            Process p = new ProcessBuilder("logcat", "-d", "-v", "time", "-t", String.valueOf(Math.max(1, n)))
-                    .redirectErrorStream(true).start();
-            StringBuilder sb = new StringBuilder();
+            List<String> cmd = new ArrayList<>();
+            cmd.add("logcat");
+            Collections.addAll(cmd, args);
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
             try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
-                while ((line = br.readLine()) != null) sb.append(line).append('\n');
+                while ((line = br.readLine()) != null) out.add(line);
             }
             p.waitFor(5, TimeUnit.SECONDS);
-            return sb.toString();
         } catch (Exception e) {
-            return "logcat failed: " + e + "\n";
+            out.add("logcat failed: " + e);
         }
+        return out;
     }
 
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
+        lastTrimLevel = level;
         DebugLog.w("onTrimMemory level=" + level);
+        if (level == TRIM_MEMORY_RUNNING_CRITICAL) bump("low_memory");
+        if (level == TRIM_MEMORY_RUNNING_LOW || level == TRIM_MEMORY_RUNNING_CRITICAL || level >= TRIM_MEMORY_MODERATE) {
+            dumpMemHistory("onTrimMemory " + level);
+        }
     }
 
     @Override
     public void onLowMemory() {
         super.onLowMemory();
         DebugLog.w("onLowMemory");
+        bump("low_memory");
+        dumpMemHistory("onLowMemory");
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        stopped = false;
+        diag.post(this::sampleAndMark);
     }
 
     @Override
     protected void onStop() {
         log("onStop");
+        stopped = true;
+        diag.post(this::sampleAndMark);
         super.onStop();
     }
 
@@ -856,6 +1093,12 @@ public class MainActivity extends Activity {
         h.removeCallbacksAndMessages(null);
         if (debugServer != null) debugServer.shutdown();
         destroyWebView();
+        // Clean shutdown: no marker means the next start won't count this run as a death.
+        synchronized (marker) {
+            destroyed = true;
+            marker.clear();
+        }
+        diagThread.quitSafely();
         super.onDestroy();
     }
 }
