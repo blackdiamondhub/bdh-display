@@ -19,6 +19,9 @@ docker run --rm -v android-sdk:/opt/sdk -v "$PWD":/src -e DEBUG_TOKEN_SHA256=<he
   eclipse-temurin:17-jdk bash /src/build.sh      # -> out/bdh-display.apk
 ```
 
+`build.sh` also runs the plain-JVM unit tests in `test/` (no Android APIs; a failure
+fails the build).
+
 Signing: Connect only upgrades an installed app if the new APK is signed with the same key. That
 key is stored in the `KEYSTORE_B64` repo secret, and release builds fail without it. Never commit
 `*.jks`. Repo secrets:
@@ -36,7 +39,7 @@ key is stored in the `KEYSTORE_B64` repo secret, and release builds fail without
 ## Debug API (port 8787, private networks only)
 
 ```
-GET  /status                 app/webview/memory state
+GET  /status                 app/webview/memory state, lifetime counters, last_unclean_exit, mem_history
 GET  /logs?since=SEQ&n=500   app log (ring buffer)
 GET  /logs/file?kb=256       persisted log incl. previous runs
 GET  /logcat?n=500           this process's logcat
@@ -44,3 +47,14 @@ GET  /screenshot?scale=0.5   JPEG of the window
 GET  /discover?secs=6        browse mDNS for hubs
 POST /eval /reload /navigate?url= /hub?url=    need the X-Debug-Token header
 ```
+
+## Crash diagnostics
+
+Android 9 has no ApplicationExitInfo, and a native/GPU crash kills the process without running
+Java code. So every 30 s the app rewrites `files/run.marker` (pid, boot id, version, memory, page
+stats) and deletes it in `onDestroy`. A marker found at startup means the previous run ended
+uncleanly. It is classified as `reboots`, `upgrades`, `bg_kills` or `process_deaths`. For
+`process_deaths`, the dead pid's logcat (including `Fatal signal` lines) is recovered into the log
+as `prev-logcat`. `/status` shows `lifetime` counters (persisted across runs), `last_unclean_exit`,
+and `mem_history` (the last 20 samples, about 10 min). The history is also logged on a renderer
+crash or hang and under memory pressure.

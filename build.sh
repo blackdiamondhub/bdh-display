@@ -37,6 +37,10 @@ EOF
 "$BT/aapt2" compile --dir res -o out/res.zip
 "$BT/aapt2" link -o out/base.apk -I "$AJ" --manifest AndroidManifest.xml out/res.zip \
   --min-sdk-version 28 --target-sdk-version 28 --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
+# Unit tests for the pure-Java classes (plain JVM; no Android APIs). Failure fails the build.
+rm -rf out/test && mkdir -p out/test
+javac -nowarn -d out/test src/com/blackdiamondlodge/display/RunMarker.java $(find test -name '*.java')
+java -cp out/test com.blackdiamondlodge.display.RunMarkerTest
 javac -nowarn --release 8 -classpath "$AJ" -d out/classes $(find src out/gen -name '*.java')
 "$BT/d8" --min-api 28 --lib "$AJ" --output out/dex $(find out/classes -name '*.class')
 cp out/base.apk out/unsigned.apk
