@@ -1,0 +1,78 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: eclipse-temurin:17-jdk
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          . ./version.properties
+          echo "version=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: /opt/sdk
+          key: android-sdk-bt34-p28
+      - name: Build APK
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          DEBUG_TOKEN_SHA256: ${{ secrets.DEBUG_TOKEN_SHA256 }}
+          # Release builds must use the real key; fork PRs (no secrets) get a throwaway one.
+          REQUIRE_KEYSTORE: ${{ github.event_name == 'push' && '1' || '0' }}
+        run: bash build.sh
+      - run: cp out/bdh-display.apk bdh-display-${{ steps.ver.outputs.version }}.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bdh-display-${{ steps.ver.outputs.version }}
+          path: bdh-display-${{ steps.ver.outputs.version }}.apk
+
+  version-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version must be new if the app changed
+        run: |
+          . ./version.properties
+          changed=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- src res AndroidManifest.xml build.sh)
+          if [ -n "$changed" ] && git ls-remote --exit-code --tags origin "refs/tags/v$VERSION_NAME" >/dev/null; then
+            echo "::error::App files changed but v$VERSION_NAME is already released; bump version.properties"
+            exit 1
+          fi
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bdh-display-${{ needs.build.outputs.version }}
+      - name: Release if version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.build.outputs.version }}
+        run: |
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "v$V already released; nothing to do"; exit 0
+          fi
+          gh release create "v$V" "bdh-display-$V.apk" --target "$GITHUB_SHA" --title "BDH Display $V" \
+            --notes "Upload bdh-display-$V.apk in UniFi Connect -> Manage Apps, then relaunch the display app."
