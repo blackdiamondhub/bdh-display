@@ -16,13 +16,16 @@ BTV=34.0.0
 VERSION_CODE=${VERSION_CODE_OVERRIDE:-$VERSION_CODE}
 VERSION_NAME=${VERSION_NAME_OVERRIDE:-$VERSION_NAME}
 KEYSTORE=${KEYSTORE:-debug.jks}
+export DEBIAN_FRONTEND=noninteractive
 need() { command -v "$1" >/dev/null || { apt-get update -qq && apt-get install -y -qq unzip zip curl >/dev/null; }; }
 need unzip; need zip; need curl
 if [ ! -x "$SDK/build-tools/$BTV/aapt2" ] || [ ! -f "$SDK/platforms/android-28/android.jar" ]; then
   mkdir -p "$SDK/cmdline-tools"
   curl -sSLo /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
   unzip -q -o /tmp/clt.zip -d "$SDK/cmdline-tools" && rm -rf "$SDK/cmdline-tools/latest" && mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-  yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "build-tools;$BTV" "platforms;android-28" >/dev/null
+  # `yes` dies of SIGPIPE when sdkmanager exits; that must not trip pipefail.
+  (set +o pipefail; yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "build-tools;$BTV" "platforms;android-28" >/dev/null)
+  [ -x "$SDK/build-tools/$BTV/aapt2" ] && [ -f "$SDK/platforms/android-28/android.jar" ] || { echo "ERROR: SDK install failed" >&2; exit 1; }
 fi
 BT=$SDK/build-tools/$BTV
 AJ=$SDK/platforms/android-28/android.jar
@@ -47,6 +50,6 @@ if [ ! -f "$KEYSTORE" ]; then
     -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname CN=throwaway >/dev/null 2>&1
 fi
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --out out/bdh-display.apk out/aligned.apk
-"$BT/apksigner" verify --print-certs out/bdh-display.apk | grep -m1 'SHA-256'
-"$BT/aapt2" dump badging out/bdh-display.apk | head -1
+"$BT/apksigner" verify --print-certs out/bdh-display.apk > out/certs.txt && grep -m1 'SHA-256' out/certs.txt
+"$BT/aapt2" dump badging out/bdh-display.apk > out/badging.txt && head -1 out/badging.txt
 ls -l out/bdh-display.apk
