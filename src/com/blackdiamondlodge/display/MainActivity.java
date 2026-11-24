@@ -301,6 +301,12 @@ public class MainActivity extends Activity {
     }
 
     private class Chrome extends WebChromeClient {
+        // WebView otherwise paints a grey play-triangle on every <video> until its first frame.
+        @Override
+        public Bitmap getDefaultVideoPoster() {
+            return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+        }
+
         @Override
         public void onShowCustomView(View v, CustomViewCallback cb) {
             if (fullscreenView != null) {
