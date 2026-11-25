@@ -35,7 +35,6 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import android.app.ActivityManager;
-import android.app.AlarmManager;
 import android.graphics.Bitmap;
 import android.os.Debug;
 import android.view.PixelCopy;
@@ -120,7 +119,7 @@ public class MainActivity extends Activity {
     private volatile boolean stopped, destroyed;
     private long lastMemDump;
 
-    // ---- Time zone (TimeZoneFix) ----
+    // ---- Time zone (TimeZoneCheck) ----
     private static final long TZ_CHECK_MS = 60 * 60_000;
     private volatile String tzState = "unchecked";
 
@@ -171,7 +170,7 @@ public class MainActivity extends Activity {
 
     // ---- Time zone -----------------------------------------------------------
 
-    /** Hourly: hub offset (diag thread) vs the page's offset (UI thread); fix the zone if they differ. */
+    /** Hourly: hub offset (diag thread) vs the page's offset (UI thread), reported in /status. */
     private final Runnable tzCheck = new Runnable() {
         @Override
         public void run() {
@@ -179,30 +178,24 @@ public class MainActivity extends Activity {
             final String hub = hubUrl;
             if (hub == null || hub.isEmpty()) return;
             diag.post(() -> {
-                Integer hubOff = TimeZoneFix.parseHubOffset(httpGet(TimeZoneFix.clockUrl(hub)));
+                Integer hubOff = TimeZoneCheck.parseHubOffset(httpGet(TimeZoneCheck.clockUrl(hub)));
                 h.post(() -> {
                     if (web == null) return;
                     web.evaluateJavascript("-new Date().getTimezoneOffset()", v -> {
                         Integer pageOff = null;
                         try { pageOff = Integer.valueOf(v.trim()); } catch (Exception ignored) {}
-                        applyZone(hubOff, pageOff);
+                        recordZone(hubOff, pageOff);
                     });
                 });
             });
         }
     };
 
-    private void applyZone(Integer hubOff, Integer pageOff) {
-        String zone = TimeZoneFix.needed(hubOff, pageOff);
-        String now = "zone=" + TimeZone.getDefault().getID() + " hub=" + hubOff + " page=" + pageOff;
-        if (zone == null) { tzState = now + " ok"; return; }
-        try {
-            ((AlarmManager) getSystemService(ALARM_SERVICE)).setTimeZone(zone);
-            tzState = now + " set " + zone;
-        } catch (Throwable t) {
-            tzState = now + " set " + zone + " failed: " + t;
-        }
-        log("time zone: " + tzState);
+    private void recordZone(Integer hubOff, Integer pageOff) {
+        String verdict = TimeZoneCheck.verdict(hubOff, pageOff);
+        String prev = tzState;
+        tzState = "zone=" + TimeZone.getDefault().getID() + " hub=" + hubOff + " page=" + pageOff + " " + verdict;
+        if (!prev.endsWith(" " + verdict)) log("time zone: " + tzState);
     }
 
     /** Diag thread only. Body of a small GET, or null. */
