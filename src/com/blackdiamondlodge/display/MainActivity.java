@@ -47,6 +47,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -62,6 +63,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.TimeZone;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -117,6 +119,10 @@ public class MainActivity extends Activity {
     private volatile boolean stopped, destroyed;
     private long lastMemDump;
 
+    // ---- Time zone (TimeZoneCheck) ----
+    private static final long TZ_CHECK_MS = 60 * 60_000;
+    private volatile String tzState = "unchecked";
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -158,7 +164,58 @@ public class MainActivity extends Activity {
         createWebView();
         loadHub();
         h.postDelayed(watchdog, WATCHDOG_INTERVAL_MS);
+        h.postDelayed(tzCheck, 60_000);
         scheduleRecycle();
+    }
+
+    // ---- Time zone -----------------------------------------------------------
+
+    /** Hourly: hub offset (diag thread) vs the page's offset (UI thread), reported in /status. */
+    private final Runnable tzCheck = new Runnable() {
+        @Override
+        public void run() {
+            h.postDelayed(this, TZ_CHECK_MS);
+            final String hub = hubUrl;
+            if (hub == null || hub.isEmpty()) return;
+            diag.post(() -> {
+                Integer hubOff = TimeZoneCheck.parseHubOffset(httpGet(TimeZoneCheck.clockUrl(hub)));
+                h.post(() -> {
+                    if (web == null) return;
+                    web.evaluateJavascript("-new Date().getTimezoneOffset()", v -> {
+                        Integer pageOff = null;
+                        try { pageOff = Integer.valueOf(v.trim()); } catch (Exception ignored) {}
+                        recordZone(hubOff, pageOff);
+                    });
+                });
+            });
+        }
+    };
+
+    private void recordZone(Integer hubOff, Integer pageOff) {
+        String verdict = TimeZoneCheck.verdict(hubOff, pageOff);
+        String prev = tzState;
+        tzState = "zone=" + TimeZone.getDefault().getID() + " hub=" + hubOff + " page=" + pageOff + " " + verdict;
+        if (!prev.endsWith(" " + verdict)) log("time zone: " + tzState);
+    }
+
+    /** Diag thread only. Body of a small GET, or null. */
+    private static String httpGet(String url) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new java.net.URL(url).openConnection();
+            c.setConnectTimeout(5_000);
+            c.setReadTimeout(5_000);
+            if (c.getResponseCode() != 200) return null;
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                StringBuilder sb = new StringBuilder();
+                for (String l; (l = br.readLine()) != null && sb.length() < 4096; ) sb.append(l);
+                return sb.toString();
+            }
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (c != null) c.disconnect();
+        }
     }
 
     // ---- WebView lifecycle -------------------------------------------------
@@ -706,7 +763,8 @@ public class MainActivity extends Activity {
                 .put("mem_history", memHistory())
                 .put("lifetime", lifetimeCounters())
                 .put("last_unclean_exit", jsonOrNull(prefs.getString("last_unclean_exit", null)))
-                .put("token_configured", !BuildInfo.DEBUG_TOKEN_SHA256.isEmpty());
+                .put("token_configured", !BuildInfo.DEBUG_TOKEN_SHA256.isEmpty())
+                .put("time_zone", tzState);
     }
 
     private static Object jsonOrNull(String s) {
