@@ -123,6 +123,20 @@ public class MainActivity extends Activity {
     private static final long TZ_CHECK_MS = 60 * 60_000;
     private volatile String tzState = "unchecked";
 
+    // ---- Wake-word listening (ListenSession); all fields UI-thread only ----
+    private static final long LISTEN_DISCOVER_MS = 5 * 60_000;
+    private static final long LISTEN_OFF_RETRY_MS = 5 * 60_000;
+    private volatile ListenSession listen;
+    private String listenOrigin;
+    private String listenState = "idle";
+    private int listenFailures;
+    private long listenOffUntil;
+    private boolean paused;
+    private double listenLevel = Double.NaN;
+    private String lastWake;
+    private int wakes;
+    private View micDot, wakeFlash;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -165,7 +179,185 @@ public class MainActivity extends Activity {
         loadHub();
         h.postDelayed(watchdog, WATCHDOG_INTERVAL_MS);
         h.postDelayed(tzCheck, 60_000);
+        h.postDelayed(listenDiscover, 10_000);
         scheduleRecycle();
+    }
+
+    // ---- Wake-word listening ---------------------------------------------------
+
+    /** Every 5 min: ask the hub where the voice app is; (re)start or stop listening. */
+    private final Runnable listenDiscover = new Runnable() {
+        @Override
+        public void run() {
+            h.postDelayed(this, LISTEN_DISCOVER_MS);
+            final String hub = hubUrl;
+            if (hub == null || hub.isEmpty()) return;
+            diag.post(() -> {
+                String url = ListenTarget.kioskUrl(hub);
+                String reply = url == null ? null : httpGet(url);
+                h.post(() -> {
+                    if (reply == null) return; // hub unreachable: keep whatever we have
+                    String origin = ListenTarget.voiceOrigin(reply);
+                    if (origin == null ? listenOrigin != null : !origin.equals(listenOrigin)) {
+                        log("listen: voice app " + (origin == null ? "gone" : "at " + origin));
+                        listenOrigin = origin;
+                        listenFailures = 0;
+                        stopListen("voice app moved");
+                    }
+                    ensureListen();
+                });
+            });
+        }
+    };
+
+    private final Runnable listenRetry = this::ensureListen;
+
+    /** Starts listening if everything allows it; safe to call any time on the UI thread. */
+    private void ensureListen() {
+        h.removeCallbacks(listenRetry);
+        if (listen != null || destroyed || paused || listenOrigin == null) return;
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            setListenState("no mic permission");
+            return;
+        }
+        synchronized (talkLock) {
+            if (talk != null) { setListenState("paused (talk)"); return; }
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now < listenOffUntil) {
+            h.postDelayed(listenRetry, listenOffUntil - now);
+            return;
+        }
+        ListenTarget t = ListenTarget.of(listenOrigin, localIp(), versionName());
+        if (t == null) { setListenState("bad origin " + listenOrigin); return; }
+        listen = new ListenSession(t, listenListener);
+        setListenState("connecting " + t);
+        listen.start();
+    }
+
+    private void stopListen(String why) {
+        h.removeCallbacks(listenRetry);
+        ListenSession s = listen;
+        listen = null;
+        listenLevel = Double.NaN;
+        showMicDot(false);
+        if (s != null) {
+            s.stop();
+            setListenState("stopped (" + why + ")");
+        }
+    }
+
+    private void setListenState(String s) {
+        if (!s.equals(listenState)) log("listen: " + s);
+        listenState = s;
+    }
+
+    private final ListenSession.Listener listenListener = new ListenSession.Listener() {
+        @Override
+        public void onState(ListenSession s, String state, String detail) {
+            h.post(() -> {
+                if (listen != s) return;
+                if ("listening".equals(state)) {
+                    setListenState("listening " + s.target);
+                    showMicDot(true);
+                    return;
+                }
+                listen = null;
+                listenLevel = Double.NaN;
+                showMicDot(false);
+                // A session that ran a while was healthy: restart the backoff.
+                if (SystemClock.elapsedRealtime() - s.startedAt > 60_000) listenFailures = 0;
+                long wait = ListenTarget.backoffMs(listenFailures++);
+                setListenState(state + (detail.isEmpty() ? "" : " " + detail) + "; retry in " + wait / 1000 + "s");
+                h.postDelayed(listenRetry, wait);
+            });
+        }
+
+        @Override
+        public void onMessage(ListenSession s, String json) {
+            h.post(() -> {
+                if (listen != s) return;
+                String type = ListenTarget.field(json, "type");
+                if ("wake".equals(type)) {
+                    onWake(ListenTarget.field(json, "word"), ListenTarget.num(json, "score"));
+                } else if ("config".equals(type) && Boolean.FALSE.equals(ListenTarget.bool(json, "listen"))) {
+                    listenOffUntil = SystemClock.elapsedRealtime() + LISTEN_OFF_RETRY_MS;
+                    stopListen("listening off in the voice app");
+                    h.postDelayed(listenRetry, LISTEN_OFF_RETRY_MS);
+                } else if ("hello".equals(type)) {
+                    log("listen: hello " + json);
+                }
+            });
+        }
+
+        @Override
+        public void onLevel(ListenSession s, double dbfs) {
+            h.post(() -> { if (listen == s) listenLevel = dbfs; });
+        }
+    };
+
+    private void onWake(String word, Double score) {
+        wakes++;
+        lastWake = String.format(Locale.US, "%s %s %.2f", isoNow(), word, score == null ? 0.0 : score);
+        log("listen: WAKE " + lastWake);
+        try {
+            android.media.ToneGenerator tg = new android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 80);
+            tg.startTone(android.media.ToneGenerator.TONE_PROP_ACK, 250);
+            h.postDelayed(tg::release, 600);
+        } catch (Exception e) {
+            DebugLog.w("wake chime failed: " + e);
+        }
+        if (wakeFlash == null) {
+            android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+            g.setColor(Color.TRANSPARENT);
+            g.setStroke(dp(10), 0xff4fc3f7);
+            wakeFlash = new View(this);
+            wakeFlash.setBackground(g);
+            root.addView(wakeFlash, new FrameLayout.LayoutParams(-1, -1));
+        }
+        wakeFlash.bringToFront();
+        wakeFlash.setAlpha(1f);
+        wakeFlash.setVisibility(View.VISIBLE);
+        wakeFlash.animate().cancel();
+        wakeFlash.animate().alpha(0f).setStartDelay(900).setDuration(600)
+                .withEndAction(() -> wakeFlash.setVisibility(View.GONE)).start();
+        if (web != null) {
+            String detail = "{word:" + JSONObject.quote(word == null ? "" : word) + ",score:" + (score == null ? 0 : score) + "}";
+            web.evaluateJavascript("window.dispatchEvent(new CustomEvent('bdh-wake',{detail:" + detail + "}))", null);
+        }
+    }
+
+    /** Small dot in the bottom-right corner while the mic is streaming. */
+    private void showMicDot(boolean on) {
+        if (micDot == null) {
+            if (!on) return;
+            android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+            g.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+            g.setColor(0x9966bb6a);
+            micDot = new View(this);
+            micDot.setBackground(g);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(8), dp(8), Gravity.BOTTOM | Gravity.END);
+            lp.setMargins(0, 0, dp(6), dp(6));
+            root.addView(micDot, lp);
+        }
+        micDot.setVisibility(on ? View.VISIBLE : View.GONE);
+        if (on) micDot.bringToFront();
+    }
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    private static String isoNow() {
+        SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US);
+        return f.format(new Date());
+    }
+
+    private JSONObject listenJson() throws Exception {
+        return new JSONObject().put("state", listenState).put("origin", listenOrigin)
+                .put("level_dbfs", Double.isNaN(listenLevel) ? JSONObject.NULL : Math.round(listenLevel * 10) / 10.0)
+                .put("failures", listenFailures).put("wakes", wakes)
+                .put("last_wake", lastWake == null ? JSONObject.NULL : lastWake);
     }
 
     // ---- Time zone -----------------------------------------------------------
@@ -642,12 +834,16 @@ public class MainActivity extends Activity {
                 return id;
             }
             TalkSession old;
+            // Android 9 allows one AudioRecord: free the listen mic before talk opens its own.
+            ListenSession l = listen;
+            if (l != null) l.stop();
             synchronized (talkLock) {
                 old = talk;
                 if (old != null) old.stop();
                 talk = new TalkSession(id, host, stream, port, talkListener);
                 talk.start();
             }
+            h.post(() -> { stopListen("talk"); setListenState("paused (talk)"); });
             if (old != null) {
                 String oldId = old.id;
                 h.post(() -> talkJs("state", "'stopped','replaced','" + oldId + "'"));
@@ -670,7 +866,10 @@ public class MainActivity extends Activity {
         @Override
         public void onState(TalkSession s, String state, String detail) {
             log("talk " + s.id + " " + state + (detail.isEmpty() ? "" : " " + detail));
-            if (!"talking".equals(state)) synchronized (talkLock) { if (talk == s) talk = null; }
+            if (!"talking".equals(state)) {
+                synchronized (talkLock) { if (talk == s) talk = null; }
+                h.postDelayed(MainActivity.this::ensureListen, 500);
+            }
             String d = JSONObject.quote(detail);
             h.post(() -> talkJs("state", "'" + state + "'," + d + ",'" + s.id + "'"));
         }
@@ -703,6 +902,7 @@ public class MainActivity extends Activity {
             s.stop();
             log("talk " + s.id + " stop (" + why + ")");
             if (!"page".equals(why)) talkJs("state", "'stopped','" + why + "','" + s.id + "'");
+            h.postDelayed(this::ensureListen, 500);
         }
     }
 
@@ -764,7 +964,8 @@ public class MainActivity extends Activity {
                 .put("lifetime", lifetimeCounters())
                 .put("last_unclean_exit", jsonOrNull(prefs.getString("last_unclean_exit", null)))
                 .put("token_configured", !BuildInfo.DEBUG_TOKEN_SHA256.isEmpty())
-                .put("time_zone", tzState);
+                .put("time_zone", tzState)
+                .put("listen", listenJson());
     }
 
     private static Object jsonOrNull(String s) {
@@ -1141,6 +1342,8 @@ public class MainActivity extends Activity {
         super.onResume();
         log("onResume");
         if (web != null) { web.onResume(); web.resumeTimers(); }
+        paused = false;
+        ensureListen();
     }
 
     @Override
@@ -1148,6 +1351,8 @@ public class MainActivity extends Activity {
         // Keep the hub running even if Connect briefly overlays something.
         log("onPause");
         stopTalk("pause");
+        paused = true;
+        stopListen("pause");
         super.onPause();
     }
 
@@ -1155,6 +1360,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         log("onDestroy");
         h.removeCallbacksAndMessages(null);
+        stopListen("destroy");
         if (debugServer != null) debugServer.shutdown();
         destroyWebView();
         // Clean shutdown: no marker means the next start won't count this run as a death.

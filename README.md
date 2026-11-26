@@ -48,6 +48,24 @@ GET  /discover?secs=6        browse mDNS for hubs
 POST /eval /reload /navigate?url= /hub?url=    need the X-Debug-Token header
 ```
 
+## Wake-word listening
+
+If the hub has the `voice` container app, the display streams its mic to it nonstop for wake-word
+detection on the hub (`ListenSession`). Every 5 min it asks `GET <hub>/display/api/kiosk/` for
+`apps.voice` (the app's `http://host:port` origin) and connects a WebSocket to
+`<origin>/voice/api/listen?display=<ip>&v=<version>`. It sends 20 ms frames of 16 kHz s16le mono
+audio and gets JSON text frames back:
+
+- `hello`: the wake words and the detection threshold.
+- `wake`: chime, a blue border flash, and a `bdh-wake` DOM event on the hub page.
+- `config` with `listen:false`: disconnect, then retry in 5 min.
+
+Without a voice app (no `voice` key) the display doesn't listen. A dropped connection retries with
+a 2 s to 60 s backoff. Listening stops while the activity is paused, and also during doorbell
+talk-back, because Android 9 allows only one `AudioRecord`. A small green dot in the bottom-right
+corner shows the mic is streaming. `/status` → `listen` shows state, level, failures and the last
+wake.
+
 ## Crash diagnostics
 
 Android 9 has no ApplicationExitInfo, and a native/GPU crash kills the process without running
