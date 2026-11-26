@@ -137,6 +137,18 @@ public class MainActivity extends Activity {
     private int wakes;
     private View micDot, wakeFlash;
 
+    // ---- Voice assistant (a conversation on the listen socket) ----
+    // player is driven from the socket reader thread; the rest is UI-thread only.
+    private final Object playerLock = new Object();
+    private volatile AssistantPlayer player;
+    private volatile boolean conversation;
+    private String assistantState = "idle";
+    private int conversations;
+    private String lastEnd, lastUser, lastReply;
+    private android.widget.LinearLayout assistantBar;
+    private TextView assistantLabel, assistantCaption;
+    private View assistantDot;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -238,6 +250,7 @@ public class MainActivity extends Activity {
     private void stopListen(String why) {
         h.removeCallbacks(listenRetry);
         ListenSession s = listen;
+        endAssistant(why, true);
         listen = null;
         listenLevel = Double.NaN;
         showMicDot(false);
@@ -266,6 +279,7 @@ public class MainActivity extends Activity {
                 listen = null;
                 listenLevel = Double.NaN;
                 showMicDot(false);
+                endAssistant("disconnected", false);
                 // A session that ran a while was healthy: restart the backoff.
                 if (SystemClock.elapsedRealtime() - s.startedAt > 60_000) listenFailures = 0;
                 long wait = ListenTarget.backoffMs(listenFailures++);
@@ -276,6 +290,14 @@ public class MainActivity extends Activity {
 
         @Override
         public void onMessage(ListenSession s, String json) {
+            AssistantMessage m = AssistantMessage.parse(json);
+            if (m != null && m.isAssistant()) {
+                if (listen != s) return;
+                // Playback control runs here, in order with the audio frames.
+                assistantAudio(m);
+                h.post(() -> { if (listen == s) onAssistant(m, json); });
+                return;
+            }
             h.post(() -> {
                 if (listen != s) return;
                 String type = ListenTarget.field(json, "type");
@@ -292,10 +314,203 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public void onAudio(ListenSession s, byte[] pcm) {
+            AssistantPlayer p = player;
+            if (listen == s && p != null && !p.released()) p.write(pcm);
+        }
+
+        @Override
         public void onLevel(ListenSession s, double dbfs) {
             h.post(() -> { if (listen == s) listenLevel = dbfs; });
         }
     };
+
+    // ---- Voice assistant ------------------------------------------------------
+
+    /** speak_* and conversation_end on the socket reader thread. */
+    private void assistantAudio(AssistantMessage m) {
+        AssistantPlayer p = player;
+        switch (m.type) {
+            case "speak_start":
+                synchronized (playerLock) {
+                    if (p == null || p.released()) player = p = new AssistantPlayer();
+                }
+                p.begin();
+                break;
+            case "speak_end":
+                if (p != null) p.end();
+                break;
+            case "speak_stop":
+                if (p != null) p.flush();
+                break;
+            case "conversation_end":
+                if (p != null) p.release();
+                break;
+            default:
+        }
+    }
+
+    /** Assistant messages on the UI thread: indicator, captions, page events. */
+    private void onAssistant(AssistantMessage m, String json) {
+        switch (m.type) {
+            case "state": {
+                String st = m.str("state");
+                if (st == null) break;
+                if (!"idle".equals(st) && !conversation) {
+                    conversation = true;
+                    conversations++;
+                    log("assistant: conversation started");
+                }
+                assistantState = st;
+                showAssistant(st, null);
+                break;
+            }
+            case "transcript": {
+                String text = m.str("text");
+                boolean user = "user".equals(m.str("role"));
+                if (text == null) break;
+                if (m.bool("final")) {
+                    if (user) lastUser = text; else lastReply = text;
+                    log("assistant: " + (user ? "user: " : "reply: ") + text);
+                }
+                caption(text, user);
+                break;
+            }
+            case "conversation_end": {
+                String reason = m.str("reason"), msg = m.str("message");
+                lastEnd = isoNow() + " " + reason + (msg == null ? "" : " (" + msg + ")");
+                log("assistant: conversation end " + lastEnd);
+                conversation = false;
+                assistantState = "idle";
+                showAssistant("idle", msg);
+                break;
+            }
+            default:
+        }
+        if (web != null) {
+            web.evaluateJavascript("window.dispatchEvent(new CustomEvent('bdh-assistant',{detail:JSON.parse("
+                    + JSONObject.quote(json) + ")}))", null);
+        }
+    }
+
+    /** Ends any conversation locally (socket gone, talk, pause); tells the app when it can. */
+    private void endAssistant(String why, boolean tellApp) {
+        AssistantPlayer p = player;
+        if (p != null) p.release();
+        if (tellApp) {
+            ListenSession l = listen;
+            if (l != null && conversation) l.sendText("{\"type\":\"end\"}");
+        }
+        if (!conversation) return;
+        conversation = false;
+        lastEnd = isoNow() + " " + why + " (kiosk)";
+        log("assistant: conversation end " + lastEnd);
+        h.post(() -> {
+            assistantState = "idle";
+            showAssistant("idle", null);
+            if (web != null) {
+                web.evaluateJavascript("window.dispatchEvent(new CustomEvent('bdh-assistant',{detail:"
+                        + "{type:'conversation_end',reason:" + JSONObject.quote(why) + "}}))", null);
+            }
+        });
+    }
+
+    private final Runnable hideAssistant = () -> {
+        if (assistantBar != null) {
+            assistantBar.animate().alpha(0f).setDuration(400)
+                    .withEndAction(() -> assistantBar.setVisibility(View.GONE)).start();
+        }
+    };
+
+    /** Bottom-centre pill with the conversation state, plus a caption above it. */
+    private void showAssistant(String state, String message) {
+        if (assistantBar == null) {
+            assistantBar = new android.widget.LinearLayout(this);
+            assistantBar.setOrientation(android.widget.LinearLayout.VERTICAL);
+            assistantBar.setGravity(Gravity.CENTER_HORIZONTAL);
+            assistantCaption = new TextView(this);
+            assistantCaption.setTextSize(20);
+            assistantCaption.setMaxLines(3);
+            assistantCaption.setEllipsize(android.text.TextUtils.TruncateAt.START);
+            assistantCaption.setGravity(Gravity.CENTER);
+            assistantCaption.setMaxWidth(getResources().getDisplayMetrics().widthPixels * 4 / 5);
+            assistantCaption.setPadding(dp(16), dp(8), dp(16), dp(8));
+            assistantCaption.setBackground(pill(0xb3000000));
+            assistantCaption.setVisibility(View.GONE);
+            android.widget.LinearLayout.LayoutParams clp = new android.widget.LinearLayout.LayoutParams(-2, -2);
+            clp.bottomMargin = dp(8);
+            assistantBar.addView(assistantCaption, clp);
+            android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12), dp(6), dp(14), dp(6));
+            row.setBackground(pill(0x99000000));
+            assistantDot = new View(this);
+            row.addView(assistantDot, new android.widget.LinearLayout.LayoutParams(dp(10), dp(10)));
+            assistantLabel = new TextView(this);
+            assistantLabel.setTextSize(14);
+            assistantLabel.setTextColor(Color.WHITE);
+            assistantLabel.setPadding(dp(8), 0, 0, 0);
+            row.addView(assistantLabel);
+            assistantBar.addView(row, new android.widget.LinearLayout.LayoutParams(-2, -2));
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+            lp.bottomMargin = dp(24);
+            root.addView(assistantBar, lp);
+        }
+        h.removeCallbacks(hideAssistant);
+        int color;
+        String label;
+        switch (state) {
+            case "listening": color = 0xff4fc3f7; label = "Listening\u2026"; break;
+            case "thinking": color = 0xffffb74d; label = "Thinking\u2026"; break;
+            case "speaking": color = 0xff81c784; label = "Speaking"; break;
+            default: color = 0xff90a4ae; label = message == null ? "Done" : "Assistant";
+        }
+        android.graphics.drawable.GradientDrawable dot = new android.graphics.drawable.GradientDrawable();
+        dot.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        dot.setColor(color);
+        assistantDot.setBackground(dot);
+        assistantLabel.setText(label);
+        if ("idle".equals(state)) {
+            if (message != null) caption(message, false);
+            h.postDelayed(hideAssistant, message != null ? 4000 : 1500);
+        } else if ("listening".equals(state) && assistantBar.getVisibility() != View.VISIBLE) {
+            assistantCaption.setVisibility(View.GONE);
+        }
+        assistantBar.animate().cancel();
+        assistantBar.setAlpha(1f);
+        assistantBar.setVisibility(View.VISIBLE);
+        assistantBar.bringToFront();
+    }
+
+    private void caption(String text, boolean user) {
+        if (assistantCaption == null) return;
+        assistantCaption.setText(text);
+        assistantCaption.setTextColor(user ? 0xffcfd8dc : Color.WHITE);
+        assistantCaption.setTypeface(null, user ? android.graphics.Typeface.ITALIC : android.graphics.Typeface.NORMAL);
+        assistantCaption.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
+    }
+
+    private android.graphics.drawable.GradientDrawable pill(int color) {
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(18));
+        return g;
+    }
+
+    private JSONObject assistantJson() throws Exception {
+        AssistantPlayer p = player;
+        ListenSession s = listen;
+        android.media.AudioManager am = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+        int stream = android.media.AudioManager.STREAM_VOICE_CALL;
+        return new JSONObject().put("state", assistantState).put("active", conversation)
+                .put("conversations", conversations)
+                .put("last_end", lastEnd == null ? JSONObject.NULL : lastEnd)
+                .put("last_user", lastUser == null ? JSONObject.NULL : lastUser)
+                .put("last_reply", lastReply == null ? JSONObject.NULL : lastReply)
+                .put("mic_aec", s == null ? JSONObject.NULL : s.aec())
+                .put("voice_call_volume", am.getStreamVolume(stream) + "/" + am.getStreamMaxVolume(stream))
+                .put("playback", p == null ? JSONObject.NULL : p.stats());
+    }
 
     private void onWake(String word, Double score) {
         wakes++;
@@ -360,7 +575,8 @@ public class MainActivity extends Activity {
                 .put("source", s == null ? JSONObject.NULL : s.source())
                 .put("level_dbfs", Double.isNaN(listenLevel) ? JSONObject.NULL : Math.round(listenLevel * 10) / 10.0)
                 .put("failures", listenFailures).put("wakes", wakes)
-                .put("last_wake", lastWake == null ? JSONObject.NULL : lastWake);
+                .put("last_wake", lastWake == null ? JSONObject.NULL : lastWake)
+                .put("assistant", assistantJson());
     }
 
     // ---- Time zone -----------------------------------------------------------
@@ -839,7 +1055,12 @@ public class MainActivity extends Activity {
             TalkSession old;
             // Android 9 allows one AudioRecord: free the listen mic before talk opens its own.
             ListenSession l = listen;
-            if (l != null) l.stop();
+            if (l != null) {
+                if (conversation) l.sendText("{\"type\":\"end\"}");
+                AssistantPlayer p = player;
+                if (p != null) p.release();
+                l.stop();
+            }
             synchronized (talkLock) {
                 old = talk;
                 if (old != null) old.stop();

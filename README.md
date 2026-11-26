@@ -68,6 +68,46 @@ corner shows the mic is streaming. The mic source is `VOICE_COMMUNICATION` (on C
 `MIC`, then `VOICE_RECOGNITION`. `/status` → `listen` shows state, source, level, failures and the
 last wake.
 
+### Voice assistant conversations (1.13)
+
+The voice app (0.2+) holds a spoken conversation with the assistant after a wake on the same
+socket. The display keeps streaming its mic throughout, which barge-in needs. Extra messages from
+the app:
+
+- binary frames: reply audio, 24 kHz s16le mono.
+- `speak_start` / `speak_end`: bracket a reply's audio.
+- `speak_stop`: the user interrupted; drop all queued and buffered audio now.
+- `state` (`state`: `listening` / `thinking` / `speaking` / `idle`): drives a small pill at the
+  bottom centre (blue / amber / green dot).
+- `transcript` (`role`: `user` / `assistant`, `text`, `final`): a caption above the pill. User text
+  is italic grey; partial captions grow until the final one.
+- `conversation_end` (`reason`, optional `message`, e.g. `not_configured`): the pill fades out.
+  The `message`, if any, is shown for 4 s.
+
+The display sends `{"type":"end"}` to end a conversation. It does so when doorbell talk-back
+takes the mic or the activity pauses.
+
+`AssistantPlayer` plays the reply audio:
+
+- on an `AudioTrack` in stream mode, with `USAGE_VOICE_COMMUNICATION` / `CONTENT_TYPE_SPEECH`,
+  so the platform echo canceller on the `VOICE_COMMUNICATION` mic uses it as its reference;
+- through a 30 s queue that drops audio beyond it, so the socket reader never blocks;
+- with a 150 ms jitter buffer before each reply;
+- flushing on `speak_stop`;
+- releasing the track at the end of the conversation.
+
+The mic also enables `AcousticEchoCanceler` when the platform has it. Every assistant message is
+also dispatched to the page as a `bdh-assistant` DOM event (`detail` = the message).
+
+`/status` → `listen.assistant` shows:
+
+- the state and conversation count;
+- the last end reason, the last user text and the last reply;
+- `mic_aec` and the voice-call stream volume;
+- `playback`: received, played, queued, dropped and flushed ms, segments, flushes and underruns.
+
+The assistant's volume follows the voice-call stream, not the media stream.
+
 ## Crash diagnostics
 
 Android 9 has no ApplicationExitInfo, and a native/GPU crash kills the process without running
