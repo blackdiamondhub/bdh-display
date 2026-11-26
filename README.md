@@ -63,8 +63,10 @@ audio and gets JSON text frames back:
 Without a voice app (no `voice` key) the display doesn't listen. A dropped connection retries with
 a 2 s to 60 s backoff. Listening stops while the activity is paused, and also during doorbell
 talk-back, because Android 9 allows only one `AudioRecord`. A small green dot in the bottom-right
-corner shows the mic is streaming. `/status` → `listen` shows state, level, failures and the last
-wake.
+corner shows the mic is streaming. The mic source is `VOICE_COMMUNICATION` (on Connect displays
+`VOICE_RECOGNITION` delivers only zeros); after 3 s of exact digital silence it falls back to
+`MIC`, then `VOICE_RECOGNITION`. `/status` → `listen` shows state, source, level, failures and the
+last wake.
 
 ## Crash diagnostics
 
