@@ -56,17 +56,24 @@ detection on the hub (`ListenSession`). Every 5 min it asks `GET <hub>/display/a
 `<origin>/voice/api/listen?display=<ip>&v=<version>`. It sends 20 ms frames of 16 kHz s16le mono
 audio and gets JSON text frames back:
 
-- `hello`: the wake words and the detection threshold.
+- `hello`: the wake words and the detection threshold; voice 0.2.0b5+ adds `ping` (seconds).
+- `ping`: the voice app's keepalive (0.2.0b5+, every 15 s).
 - `wake`: chime, a blue border flash, and a `bdh-wake` DOM event on the hub page.
 - `config` with `listen:false`: disconnect, then retry in 5 min.
 
 Without a voice app (no `voice` key) the display doesn't listen. A dropped connection retries with
-a 2 s to 60 s backoff. Listening stops while the activity is paused, and also during doorbell
+a 1 s to 30 s backoff, reset after a connection that got its `hello` and lasted 30 s; it never gives
+up. Because websocket pings only reach the hub's proxy, the display also checks the app itself
+(`ListenLiveness`, every 5 s) and drops and reconnects a socket that got no `hello` within 15 s, or,
+once the app has shown it pings, that heard nothing from the app for 3 intervals (45 s). Older voice
+apps that never ping are held only to the `hello` rule (1.14). Listening stops while the activity is paused, and also during doorbell
 talk-back, because Android 9 allows only one `AudioRecord`. A small green dot in the bottom-right
 corner shows the mic is streaming. The mic source is `VOICE_COMMUNICATION` (on Connect displays
 `VOICE_RECOGNITION` delivers only zeros); after 3 s of exact digital silence it falls back to
 `MIC`, then `VOICE_RECOGNITION`. `/status` → `listen` shows state, source, level, failures and the
-last wake.
+last wake; `listen.socket` shows `open`, `connects`/`reconnects`, `stale_drops` (liveness
+reconnects), `hello`, `ping_s`, `idle_limit_s`, `since_rx_s` (seconds since the app last sent
+anything), `messages` and `age_s`.
 
 ### Voice assistant conversations (1.13)
 

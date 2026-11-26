@@ -26,11 +26,12 @@ public final class ListenTargetTest {
         eq("https refused (plain socket only)", ListenTarget.of("https://h:443", "x", "1"), null);
         eq("null origin", ListenTarget.of(null, "x", "1"), null);
 
-        eq("backoff first", ListenTarget.backoffMs(0), 2_000L);
-        eq("backoff doubles", ListenTarget.backoffMs(1), 4_000L);
-        eq("backoff 3", ListenTarget.backoffMs(3), 16_000L);
-        eq("backoff capped", ListenTarget.backoffMs(5), 60_000L);
-        eq("backoff stays capped", ListenTarget.backoffMs(500), 60_000L);
+        eq("backoff first", ListenTarget.backoffMs(0), 1_000L);
+        eq("backoff doubles", ListenTarget.backoffMs(1), 2_000L);
+        eq("backoff 4", ListenTarget.backoffMs(4), 16_000L);
+        eq("backoff capped", ListenTarget.backoffMs(5), 30_000L);
+        eq("backoff stays capped", ListenTarget.backoffMs(500), 30_000L);
+        eq("backoff never negative", ListenTarget.backoffMs(-3), 1_000L);
 
         String wake = "{\"type\": \"wake\", \"word\": \"hey_jarvis\", \"score\": 0.91, \"at\": \"2026-11-26T10:00:00Z\"}";
         eq("type", ListenTarget.field(wake, "type"), "wake");
