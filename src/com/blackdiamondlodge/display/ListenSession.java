@@ -18,12 +18,16 @@ import java.security.SecureRandom;
  * Streams the display's microphone, nonstop, to the voice app's listen
  * WebSocket for wake-word detection on the hub: binary frames of 20 ms
  * 16 kHz s16le mono, like {@link TalkSession}. The server's text frames
- * (JSON: hello, wake, config) go to {@link Listener#onMessage}.
+ * (JSON: hello, wake, config and the assistant's messages) go to
+ * {@link Listener#onMessage}; its binary frames (assistant reply audio,
+ * 24 kHz s16le mono) to {@link Listener#onAudio}. Both are called on the
+ * reader thread, in order.
  */
 final class ListenSession {
     interface Listener {
         void onState(ListenSession s, String state, String detail);
         void onMessage(ListenSession s, String json);
+        void onAudio(ListenSession s, byte[] pcm);
         void onLevel(ListenSession s, double dbfs);
     }
 
@@ -140,6 +144,7 @@ final class ListenSession {
                 if (op == 0x8) break;
                 if (op == 0x9) send(0xA, p, p.length);
                 else if (op == 0x1 && !stopped) listener.onMessage(this, new String(p, StandardCharsets.UTF_8));
+                else if (op == 0x2 && !stopped) listener.onAudio(this, p);
             }
         } catch (IOException ignored) {
         }
@@ -158,6 +163,23 @@ final class ListenSession {
     private static final int DEAD_FRAMES = 150;
 
     private volatile int sourceIdx;
+    private volatile boolean aecOn;
+
+    /** Whether the platform echo canceller is on for the mic. */
+    boolean aec() {
+        return aecOn;
+    }
+
+    /** Sends a JSON text message, e.g. {@code {"type":"end"}}; false if the socket is gone. */
+    boolean sendText(String json) {
+        try {
+            byte[] b = json.getBytes(StandardCharsets.UTF_8);
+            send(0x1, b, b.length);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
     String source() {
         return SOURCE_NAMES[sourceIdx];
@@ -175,6 +197,12 @@ final class ListenSession {
             android.media.audiofx.AutomaticGainControl agc =
                     android.media.audiofx.AutomaticGainControl.create(r.getAudioSessionId());
             if (agc != null) try { agc.setEnabled(true); } catch (Exception ignored) { }
+        }
+        // Echo cancellation against the assistant's voice-communication playback (barge-in).
+        if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
+            android.media.audiofx.AcousticEchoCanceler aec =
+                    android.media.audiofx.AcousticEchoCanceler.create(r.getAudioSessionId());
+            if (aec != null) try { aec.setEnabled(true); aecOn = aec.getEnabled(); } catch (Exception ignored) { }
         }
         r.startRecording();
         if (r.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) throw new IOException("mic busy");
