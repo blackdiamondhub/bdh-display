@@ -1,0 +1,208 @@
+package com.blackdiamondlodge.display;
+
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
+import android.os.SystemClock;
+import android.util.Base64;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+
+/**
+ * Streams the display's microphone, nonstop, to the voice app's listen
+ * WebSocket for wake-word detection on the hub: binary frames of 20 ms
+ * 16 kHz s16le mono, like {@link TalkSession}. The server's text frames
+ * (JSON: hello, wake, config) go to {@link Listener#onMessage}.
+ */
+final class ListenSession {
+    interface Listener {
+        void onState(ListenSession s, String state, String detail);
+        void onMessage(ListenSession s, String json);
+        void onLevel(ListenSession s, double dbfs);
+    }
+
+    private static final long LEVEL_MS = 1000;
+
+    final ListenTarget target;
+    final long startedAt = SystemClock.elapsedRealtime();
+    private final Listener listener;
+    private final SecureRandom rnd = new SecureRandom();
+    private volatile boolean stopped;
+    private volatile Socket sock;
+    private volatile AudioRecord rec;
+    private final Object sendLock = new Object();
+
+    ListenSession(ListenTarget target, Listener listener) {
+        this.target = target;
+        this.listener = listener;
+    }
+
+    void start() {
+        Thread t = new Thread(this::run, "listen");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Ends the session from any thread; no further callbacks are sent. */
+    void stop() {
+        if (stopped) return;
+        stopped = true;
+        closeQuietly();
+    }
+
+    boolean stopped() {
+        return stopped;
+    }
+
+    private void run() {
+        String end = "closed", detail = "";
+        try {
+            connect();
+            openMic();
+            if (stopped) return;
+            listener.onState(this, "listening", "");
+            pump();
+        } catch (Exception e) {
+            if (stopped) return;
+            end = "error";
+            detail = e.getClass().getSimpleName() + ": " + e.getMessage();
+        } finally {
+            boolean wasStopped = stopped;
+            stopped = true;
+            closeQuietly();
+            if (!wasStopped) listener.onState(this, end, detail);
+        }
+    }
+
+    private void connect() throws IOException {
+        Socket s = new Socket();
+        sock = s;
+        s.connect(new InetSocketAddress(target.host, target.port), 3000);
+        s.setTcpNoDelay(true);
+        s.setSoTimeout(5000);
+        byte[] nonce = new byte[16];
+        rnd.nextBytes(nonce);
+        String key = Base64.encodeToString(nonce, Base64.NO_WRAP);
+        String req = "GET " + target.path + " HTTP/1.1\r\n"
+                + "Host: " + target.host + ":" + target.port + "\r\n"
+                + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                + "Sec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        OutputStream out = s.getOutputStream();
+        out.write(req.getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+        String head = readHead(s.getInputStream());
+        String status = head.split("\r\n", 2)[0];
+        if (!status.contains(" 101 ")) throw new IOException("upgrade refused: " + status);
+        if (!head.toLowerCase().contains(("sec-websocket-accept: " + TalkSession.accept(key)).toLowerCase())) {
+            throw new IOException("bad Sec-WebSocket-Accept");
+        }
+        s.setSoTimeout(0);
+        Thread r = new Thread(this::readLoop, "listen-rd");
+        r.setDaemon(true);
+        r.start();
+    }
+
+    private static String readHead(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() < 8192) {
+            int c = in.read();
+            if (c < 0) throw new IOException("closed during upgrade");
+            sb.append((char) c);
+            if (sb.length() >= 4 && sb.substring(sb.length() - 4).equals("\r\n\r\n")) return sb.toString();
+        }
+        throw new IOException("upgrade reply too long");
+    }
+
+    /** Server frames: text messages to the listener, answer pings, end on close/EOF. */
+    private void readLoop() {
+        try {
+            InputStream in = sock.getInputStream();
+            while (!stopped) {
+                int b0 = in.read(), b1 = in.read();
+                if (b0 < 0 || b1 < 0) break;
+                long len = b1 & 0x7f;
+                if (len == 126) len = (in.read() << 8) | in.read();
+                else if (len == 127) { len = 0; for (int i = 0; i < 8; i++) len = (len << 8) | in.read(); }
+                if (len > 65536) break;
+                byte[] p = new byte[(int) len];
+                for (int n = 0; n < len; ) {
+                    int k = in.read(p, n, (int) len - n);
+                    if (k < 0) throw new IOException("eof");
+                    n += k;
+                }
+                int op = b0 & 0x0f;
+                if (op == 0x8) break;
+                if (op == 0x9) send(0xA, p, p.length);
+                else if (op == 0x1 && !stopped) listener.onMessage(this, new String(p, StandardCharsets.UTF_8));
+            }
+        } catch (IOException ignored) {
+        }
+        if (!stopped) closeQuietly();
+    }
+
+    /**
+     * VOICE_RECOGNITION: the source meant for speech recognisers (no
+     * communication processing that could smear the wake word).
+     */
+    private void openMic() throws IOException {
+        int min = AudioRecord.getMinBufferSize(TalkSession.RATE, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT);
+        AudioRecord r = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, TalkSession.RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                Math.max(min, TalkSession.FRAME_BYTES * 16));
+        rec = r;
+        if (r.getState() != AudioRecord.STATE_INITIALIZED) throw new IOException("mic unavailable");
+        r.startRecording();
+        if (r.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) throw new IOException("mic busy");
+    }
+
+    private void pump() throws IOException {
+        byte[] buf = new byte[TalkSession.FRAME_BYTES];
+        long lastLevel = 0;
+        while (!stopped) {
+            int n = 0;
+            while (n < buf.length) {
+                AudioRecord r = rec;
+                if (r == null) throw new IOException("mic closed");
+                int k = r.read(buf, n, buf.length - n);
+                if (k <= 0) throw new IOException("mic read " + k);
+                n += k;
+            }
+            send(0x2, buf, n);
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastLevel >= LEVEL_MS) {
+                lastLevel = now;
+                listener.onLevel(this, TalkSession.dbfs(buf, n));
+            }
+        }
+    }
+
+    private void send(int opcode, byte[] payload, int len) throws IOException {
+        byte[] f = TalkSession.frame(opcode, payload, len, rnd);
+        Socket s = sock;
+        if (s == null) throw new IOException("closed");
+        synchronized (sendLock) {
+            s.getOutputStream().write(f);
+        }
+    }
+
+    private void closeQuietly() {
+        AudioRecord r = rec;
+        rec = null;
+        if (r != null) {
+            try { r.stop(); } catch (Exception ignored) { }
+            r.release();
+        }
+        Socket s = sock;
+        if (s != null) {
+            try { send(0x8, new byte[]{0x03, (byte) 0xe8}, 2); } catch (Exception ignored) { }
+            try { s.close(); } catch (IOException ignored) { }
+        }
+    }
+}
