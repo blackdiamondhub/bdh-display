@@ -58,10 +58,10 @@ final class ListenTarget {
         }
     }
 
-    /** Reconnect delay after {@code failures} consecutive failures: 2 s doubling, capped at 60 s. */
+    /** Reconnect delay after {@code failures} consecutive failures: 1 s doubling, capped at 30 s. */
     static long backoffMs(int failures) {
-        if (failures <= 0) return 2_000;
-        return Math.min(60_000, 2_000L << Math.min(failures, 5));
+        if (failures <= 0) return 1_000;
+        return Math.min(30_000, 1_000L << Math.min(failures, 5));
     }
 
     /** Value of a string field in a flat server message, e.g. {@code type}. */

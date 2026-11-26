@@ -35,9 +35,12 @@ final class ListenSession {
 
     final ListenTarget target;
     final long startedAt = SystemClock.elapsedRealtime();
+    /** What the app has sent and when, for the owner's dead-socket check. */
+    final ListenLiveness liveness = new ListenLiveness();
     private final Listener listener;
     private final SecureRandom rnd = new SecureRandom();
     private volatile boolean stopped;
+    private volatile String abortReason;
     private volatile Socket sock;
     private volatile AudioRecord rec;
     private final Object sendLock = new Object();
@@ -64,6 +67,21 @@ final class ListenSession {
         return stopped;
     }
 
+    /**
+     * Drops a socket that looks dead; the session then ends with state
+     * "error" and {@code why} like any other failure, so the owner retries.
+     * Doesn't block (no close frame: the socket may be wedged mid-write) and
+     * only acts once; false if the session already ended or was aborted.
+     */
+    boolean abort(String why) {
+        if (stopped || abortReason != null) return false;
+        abortReason = why;
+        releaseMic();
+        Socket s = sock;
+        if (s != null) try { s.close(); } catch (IOException ignored) { }
+        return true;
+    }
+
     private void run() {
         String end = "closed", detail = "";
         try {
@@ -75,7 +93,8 @@ final class ListenSession {
         } catch (Exception e) {
             if (stopped) return;
             end = "error";
-            detail = e.getClass().getSimpleName() + ": " + e.getMessage();
+            String why = abortReason;
+            detail = why != null ? why : e.getClass().getSimpleName() + ": " + e.getMessage();
         } finally {
             boolean wasStopped = stopped;
             stopped = true;
@@ -107,6 +126,7 @@ final class ListenSession {
             throw new IOException("bad Sec-WebSocket-Accept");
         }
         s.setSoTimeout(0);
+        liveness.opened(SystemClock.elapsedRealtime());
         Thread r = new Thread(this::readLoop, "listen-rd");
         r.setDaemon(true);
         r.start();
@@ -142,9 +162,16 @@ final class ListenSession {
                 }
                 int op = b0 & 0x0f;
                 if (op == 0x8) break;
+                // Websocket pings come from the hub's proxy, not the app: they don't count as alive.
                 if (op == 0x9) send(0xA, p, p.length);
-                else if (op == 0x1 && !stopped) listener.onMessage(this, new String(p, StandardCharsets.UTF_8));
-                else if (op == 0x2 && !stopped) listener.onAudio(this, p);
+                else if (op == 0x1 && !stopped) {
+                    String json = new String(p, StandardCharsets.UTF_8);
+                    liveness.message(SystemClock.elapsedRealtime(), json);
+                    listener.onMessage(this, json);
+                } else if (op == 0x2 && !stopped) {
+                    liveness.frame(SystemClock.elapsedRealtime());
+                    listener.onAudio(this, p);
+                }
             }
         } catch (IOException ignored) {
         }

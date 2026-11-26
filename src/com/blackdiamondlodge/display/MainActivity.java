@@ -126,10 +126,15 @@ public class MainActivity extends Activity {
     // ---- Wake-word listening (ListenSession); all fields UI-thread only ----
     private static final long LISTEN_DISCOVER_MS = 5 * 60_000;
     private static final long LISTEN_OFF_RETRY_MS = 5 * 60_000;
+    /** How often the listen socket's liveness is checked. */
+    private static final long LISTEN_WATCH_MS = 5_000;
+    /** A session that got its hello and lived this long was good: restart the backoff. */
+    private static final long LISTEN_HEALTHY_MS = 30_000;
     private volatile ListenSession listen;
     private String listenOrigin;
     private String listenState = "idle";
     private int listenFailures;
+    private int listenConnects, listenStale;
     private long listenOffUntil;
     private boolean paused;
     private double listenLevel = Double.NaN;
@@ -192,6 +197,7 @@ public class MainActivity extends Activity {
         h.postDelayed(watchdog, WATCHDOG_INTERVAL_MS);
         h.postDelayed(tzCheck, 60_000);
         h.postDelayed(listenDiscover, 10_000);
+        h.postDelayed(listenWatch, LISTEN_WATCH_MS);
         scheduleRecycle();
     }
 
@@ -223,6 +229,25 @@ public class MainActivity extends Activity {
     };
 
     private final Runnable listenRetry = this::ensureListen;
+
+    /**
+     * Every 5 s: drop a listen socket the voice app no longer answers on (no
+     * hello, or its keepalive pings stopped); the session then fails and is
+     * retried with the usual backoff.
+     */
+    private final Runnable listenWatch = new Runnable() {
+        @Override
+        public void run() {
+            h.postDelayed(this, LISTEN_WATCH_MS);
+            ListenSession s = listen;
+            if (s == null) return;
+            String why = s.liveness.stale(SystemClock.elapsedRealtime());
+            if (why != null && s.abort(why)) {
+                listenStale++;
+                log("listen: " + why + ", reconnecting");
+            }
+        }
+    };
 
     /** Starts listening if everything allows it; safe to call any time on the UI thread. */
     private void ensureListen() {
@@ -271,7 +296,8 @@ public class MainActivity extends Activity {
             h.post(() -> {
                 if (listen != s) return;
                 if ("listening".equals(state)) {
-                    if (!detail.isEmpty()) log("listen: " + detail);
+                    if (detail.isEmpty()) listenConnects++;
+                    else log("listen: " + detail);
                     setListenState("listening " + s.target);
                     showMicDot(true);
                     return;
@@ -280,8 +306,8 @@ public class MainActivity extends Activity {
                 listenLevel = Double.NaN;
                 showMicDot(false);
                 endAssistant("disconnected", false);
-                // A session that ran a while was healthy: restart the backoff.
-                if (SystemClock.elapsedRealtime() - s.startedAt > 60_000) listenFailures = 0;
+                // A session that was greeted and ran a while was healthy: restart the backoff.
+                if (s.liveness.healthy(SystemClock.elapsedRealtime(), LISTEN_HEALTHY_MS)) listenFailures = 0;
                 long wait = ListenTarget.backoffMs(listenFailures++);
                 setListenState(state + (detail.isEmpty() ? "" : " " + detail) + "; retry in " + wait / 1000 + "s");
                 h.postDelayed(listenRetry, wait);
@@ -575,8 +601,25 @@ public class MainActivity extends Activity {
                 .put("source", s == null ? JSONObject.NULL : s.source())
                 .put("level_dbfs", Double.isNaN(listenLevel) ? JSONObject.NULL : Math.round(listenLevel * 10) / 10.0)
                 .put("failures", listenFailures).put("wakes", wakes)
+                .put("socket", listenSocketJson(s))
                 .put("last_wake", lastWake == null ? JSONObject.NULL : lastWake)
                 .put("assistant", assistantJson());
+    }
+
+    /** The listen socket's health: is it up, how often it (re)connected, when the app last spoke. */
+    private JSONObject listenSocketJson(ListenSession s) throws Exception {
+        long now = SystemClock.elapsedRealtime();
+        JSONObject o = new JSONObject().put("open", s != null && s.liveness.sinceRxMs(now) >= 0)
+                .put("connects", listenConnects).put("reconnects", Math.max(0, listenConnects - 1))
+                .put("stale_drops", listenStale);
+        if (s == null) return o;
+        long rx = s.liveness.sinceRxMs(now);
+        return o.put("hello", s.liveness.helloSeen())
+                .put("ping_s", s.liveness.pingMs() / 1000)
+                .put("idle_limit_s", s.liveness.idleLimitMs() / 1000)
+                .put("since_rx_s", rx < 0 ? JSONObject.NULL : rx / 1000)
+                .put("messages", s.liveness.messages())
+                .put("age_s", (now - s.startedAt) / 1000);
     }
 
     // ---- Time zone -----------------------------------------------------------
