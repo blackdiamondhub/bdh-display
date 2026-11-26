@@ -147,24 +147,58 @@ final class ListenSession {
     }
 
     /**
-     * VOICE_RECOGNITION: the source meant for speech recognisers (no
-     * communication processing that could smear the wake word).
+     * Mic sources in order of preference. On UniFi Connect displays
+     * VOICE_RECOGNITION yields all-zero samples, while VOICE_COMMUNICATION
+     * (the doorbell talk-back source) carries real audio.
      */
+    private static final int[] SOURCES = {MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC, MediaRecorder.AudioSource.VOICE_RECOGNITION};
+    private static final String[] SOURCE_NAMES = {"voice_communication", "mic", "voice_recognition"};
+    /** Frames (20 ms) of exact digital silence before trying the next source: 3 s. */
+    private static final int DEAD_FRAMES = 150;
+
+    private volatile int sourceIdx;
+
+    String source() {
+        return SOURCE_NAMES[sourceIdx];
+    }
+
     private void openMic() throws IOException {
         int min = AudioRecord.getMinBufferSize(TalkSession.RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
-        AudioRecord r = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, TalkSession.RATE,
+        AudioRecord r = new AudioRecord(SOURCES[sourceIdx], TalkSession.RATE,
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
                 Math.max(min, TalkSession.FRAME_BYTES * 16));
         rec = r;
         if (r.getState() != AudioRecord.STATE_INITIALIZED) throw new IOException("mic unavailable");
+        if (android.media.audiofx.AutomaticGainControl.isAvailable()) {
+            android.media.audiofx.AutomaticGainControl agc =
+                    android.media.audiofx.AutomaticGainControl.create(r.getAudioSessionId());
+            if (agc != null) try { agc.setEnabled(true); } catch (Exception ignored) { }
+        }
         r.startRecording();
         if (r.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) throw new IOException("mic busy");
+    }
+
+    private void releaseMic() {
+        AudioRecord r = rec;
+        rec = null;
+        if (r != null) {
+            try { r.stop(); } catch (Exception ignored) { }
+            r.release();
+        }
+    }
+
+    private static boolean allZero(byte[] b, int n) {
+        for (int i = 0; i < n; i++) if (b[i] != 0) return false;
+        return true;
     }
 
     private void pump() throws IOException {
         byte[] buf = new byte[TalkSession.FRAME_BYTES];
         long lastLevel = 0;
+        int deadFrames = 0;
+        boolean live = false;
         while (!stopped) {
             int n = 0;
             while (n < buf.length) {
@@ -175,6 +209,20 @@ final class ListenSession {
                 n += k;
             }
             send(0x2, buf, n);
+            if (!live) {
+                if (!allZero(buf, n)) {
+                    live = true;
+                } else if (++deadFrames >= DEAD_FRAMES && sourceIdx + 1 < SOURCES.length) {
+                    String dead = source();
+                    releaseMic();
+                    sourceIdx++;
+                    deadFrames = 0;
+                    listener.onState(this, "listening", "source " + dead + " silent, trying " + source());
+                    openMic();
+                    if (stopped) releaseMic();
+                    continue;
+                }
+            }
             long now = SystemClock.elapsedRealtime();
             if (now - lastLevel >= LEVEL_MS) {
                 lastLevel = now;
@@ -193,12 +241,7 @@ final class ListenSession {
     }
 
     private void closeQuietly() {
-        AudioRecord r = rec;
-        rec = null;
-        if (r != null) {
-            try { r.stop(); } catch (Exception ignored) { }
-            r.release();
-        }
+        releaseMic();
         Socket s = sock;
         if (s != null) {
             try { send(0x8, new byte[]{0x03, (byte) 0xe8}, 2); } catch (Exception ignored) { }

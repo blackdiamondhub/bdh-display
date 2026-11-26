@@ -258,6 +258,7 @@ public class MainActivity extends Activity {
             h.post(() -> {
                 if (listen != s) return;
                 if ("listening".equals(state)) {
+                    if (!detail.isEmpty()) log("listen: " + detail);
                     setListenState("listening " + s.target);
                     showMicDot(true);
                     return;
@@ -354,7 +355,9 @@ public class MainActivity extends Activity {
     }
 
     private JSONObject listenJson() throws Exception {
+        ListenSession s = listen;
         return new JSONObject().put("state", listenState).put("origin", listenOrigin)
+                .put("source", s == null ? JSONObject.NULL : s.source())
                 .put("level_dbfs", Double.isNaN(listenLevel) ? JSONObject.NULL : Math.round(listenLevel * 10) / 10.0)
                 .put("failures", listenFailures).put("wakes", wakes)
                 .put("last_wake", lastWake == null ? JSONObject.NULL : lastWake);
